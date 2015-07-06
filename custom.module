@@ -1,0 +1,161 @@
+<?php
+/*
+* Hook  _cmis_sync_cmis_drupal_prepare
+*/
+function custom_menu(){
+  $items['articlefile'] = array(
+    'title' => 'Article File',
+    'page callback' => 'custom_cmis_article_file',
+    'access arguments' => array('access content'),
+  );
+  return $items;
+}
+
+function custom_cmis_article_file(){
+  module_load_include('api.inc', 'cmis');
+  module_load_include('inc', 'node', 'node.pages');
+  module_load_include('inc','cmis_sync','cmis_sync.cmis');
+  $sync_map = variable_get('cmis_sync_map', array());
+  foreach ($sync_map as $node_type => $sync_map_type) {
+    // check if sync is enabled for this Drupal content type
+    if (!array_key_exists('enabled',  $sync_map_type) || !$sync_map_type['enabled']) {
+      continue;
+    }
+    // merge in defaults
+    $sync_map_type += array(
+      'fields' => array(),
+      'content_field' => 'body',
+      'cmis_type' => 'cmis:document',
+      'cmis_repositoryId' => 'default',
+      'subfolders' => FALSE,
+      'deletes' => FALSE,
+      'full_sync_next_cron' => FALSE
+    );
+
+    try {
+
+      // lookup CMIS repository
+       $repository = cmis_get_repository($sync_map_type['cmis_repositoryId']);
+       if (isset($sync_map_type['cmis_folderId'])) {
+    $cmis_folder = cmisapi_getProperties($repository->repositoryId, $sync_map_type['cmis_folderId']);
+  }
+  elseif (isset($sync_map_type['cmis_folderPath'])) {
+    $cmis_folder = cmisapi_getObjectByPath($repository->repositoryId, $sync_map_type['cmis_folderPath']);
+  }
+  else {
+    throw new CMISException(t("Please set `cmis_folderPath` or `cmis_folderId` properties for [@type] Drupal type.", array(
+      '@type' => $node_type
+    )));
+  }
+       $sync_subfolders_rule = $sync_map_type['subfolders']?'IN_TREE':'IN_FOLDER';
+       $sync_full_rule =  $sync_map_type['full_sync_next_cron']?'':sprintf('AND cmis:lastModificationDate > TIMESTAMP \'%s\'', date('Y-m-d\TH:i:s.000-00:00', $last_sync_time));
+       $sync_order_by_rule = sprintf('order by adv:articleDate DESC');//cmis:creationDate
+       $hash_values[OPT_MAX_ITEMS] = 100;
+       $hash_values[OPT_SKIP_COUNT] = 0;
+
+       $cmis_query = sprintf('SELECT * FROM %s WHERE %s(\'%s\') %s %s', $sync_map_type['cmis_type'], $sync_subfolders_rule, $cmis_folder->id, $sync_full_rule,$sync_order_by_rule);
+       $cmis_updates = cmisapi_query($repository->repositoryId, $cmis_query,$hash_values);
+       foreach ($cmis_updates->objectList as $cmis_update) {
+         $drupal_node = _cmis_sync_cmis_drupal_prepare($repository, $sync_map_type, $node_type, $cmis_update);
+         $article_file = $drupal_node->field_article_files['und'][0]['value'];echo '<br>';
+         global $user;
+          $node = new stdClass();
+          $node->title = $drupal_node->title;
+          $node->type = 'article';
+          node_object_prepare($node);
+          $node->language = 'en';
+          $node->uid = $user->uid;
+          $node->status = 1;
+         if($article_file != ''){
+         $art_workspace = explode("/", $article_file);
+         $file_date = explode("-", $drupal_node->article_file_creation_date);
+         $file_workspace = explode("/",$drupal_node->field_object_id['und'][0]['value']);
+         $server_path = variable_get('alfresco_url');
+         $article_path = $server_path . $file_date[0] . "/" . $file_date[1] . "/" . substr($file_date[2] , 0 , 2) . "/" . $art_workspace[3] . "/";
+         if($art_workspace[3] != ""){
+            $objid = cmisapi_getProperties($repository->repositoryId, $article_file);
+            $article_file_name = $objid->properties['cmis:contentStreamFileName'];
+         }
+         $article_file_url = $article_path .$article_file_name;
+          $session = curl_init();
+          curl_setopt($session, CURLOPT_URL,$article_file_url);
+          //curl_setopt($session, CURLOPT_VERBOSE, 1);
+          //curl_setopt($session, CURLOPT_HEADER, FALSE);
+          curl_setopt($session, CURLOPT_RETURNTRANSFER, TRUE);
+          //curl_setopt($session, CURLOPT_CONNECTTIMEOUT, 4);
+          $return_data = curl_exec($session);
+          $httpcode = curl_getinfo($session, CURLINFO_HTTP_CODE);
+          if ($httpcode != 200) {
+            watchdog("cURL Hit Failure", "URL @url returned HTTP status code: @httpcode", array("@url" => $article_file_url, "@httpcode" => $httpcode, $severity = WATCHDOG_WARNING));
+          }
+          if(curl_error($session)){
+            continue;
+          }
+          curl_close($session);
+          $file_type_value = $drupal_node->field_article_date['und'][0]['value'];
+          $file_format = explode(".", $file_type_value);
+          $extension = '';
+          if (count($file_format)) {
+            $file_extension_key = count($file_format) - 1;
+            $extension = $file_format[$file_extension_key];
+          }
+
+          $doc = new DOMDocument();
+            @$doc->loadHTML($return_data);
+            $imageTags = $doc->getElementsByTagName('img');
+            foreach($imageTags as $tag) {
+              $image_rel_name = $tag->getAttribute('src');
+              if (substr($image_rel_name,0,4) == 'http') {
+                $return = $tag->setAttribute('src', $image_rel_name);
+              } else {
+                $return = $tag->setAttribute('src', $article_path . $image_rel_name);
+              }
+            }
+            // for input of type image
+            $input_tags = $doc->getElementsByTagName('input');
+            foreach($input_tags as $tag) {
+              $image_rel_name = $tag->getAttribute('src');
+              if ($image_rel_name) {
+                $return = $tag->setAttribute('src', $article_path . $image_rel_name);
+              }
+            }
+          $return_data = $doc->saveHTML();
+          $node->body['und'][0]['value'] = $return_data;
+          $node->body['und'][0]['summary'] = '';
+          $node->body['und'][0]['format'] = 'full_html';
+         }//article condition end
+         else{
+           $node->body['und'][0]['value'] = $drupal_node->body['und'][0]['value'];
+           $node->body['und'][0]['summary'] = '';
+           $node->body['und'][0]['format'] = 'full_html';
+         }
+          $node->field_object_id['und'][0]['value'] = $drupal_node->field_article_date['und'][0]['value'];
+          $node->field_object_id['und'][0]['summary'] = '';
+          $node->field_object_id['und'][0]['format'] = 'full_html';
+          $node->field_article_files['und'][0]['value'] = $drupal_node->field_article_files['und'][0]['value'];
+          $node->field_article_files['und'][0]['summary'] = '';
+          $node->field_article_files['und'][0]['format'] = 'full_html';
+          $node->field_article_date['und'][0]['value'] = $drupal_node->field_article_date['und'][0]['value'];
+          $node->field_article_date['und'][0]['summary'] = '';
+          $node->field_article_date['und'][0]['format'] = 'full_html';
+          $node->article_file_creation_date['und'][0]['value'] = $drupal_node->article_file_creation_date['und'][0]['value'];
+          $node->article_file_creation_date['und'][0]['summary'] = '';
+          $node->article_file_creation_date['und'][0]['format'] = 'full_html';
+          $node->field_article_status['und'][0]['value'] = $drupal_node->field_article_status['und'][0]['value'];
+          $node->field_article_status['und'][0]['summary'] = '';
+          $node->field_article_status['und'][0]['format'] = 'full_html';
+          $node->field_article_link_display['und'][0]['value'] = $drupal_node->field_article_link_display['und'][0]['value'];
+          $node->field_article_link_display['und'][0]['summary'] = '';
+          $node->field_article_link_display['und'][0]['format'] = 'full_html';
+          $node = node_submit($node);
+          node_save($node);
+       }
+    }
+
+    catch (CMISException $e) {
+      cmis_error_handler('cmis_sync_cron', $e);
+    }
+  }
+
+exit(); // It may also redirect to content list page but currently it will exit after sync data.
+}
