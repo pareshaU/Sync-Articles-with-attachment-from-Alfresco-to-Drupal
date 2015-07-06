@@ -1,5 +1,5 @@
-# Sync-Articles-with-attachment-from-Alfresco-to-Drupal
-Sample code for Sync Articles with attachment from Alfresco to Drupal using CMIS
+# Sync-Articles-with-attachment-from-Alfresco-to-Drupal7
+Sample code for Sync Articles with attachment from Alfresco to Drupal7 using CMIS
 <br>
 <b>settings.php</b>
 <br>
